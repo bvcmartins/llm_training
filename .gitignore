@@ -1,0 +1,13 @@
+checkpoints/
+
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# wandb local logs
+wandb/

@@ -1,0 +1,30 @@
+[project]
+name = "llm-training"
+version = "0.1.0"
+description = "From-scratch LLM training (v1: GPT-2 Large on FineWeb-Edu, v2: Qwen3-0.6B on multi-source mix)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    # Core training stack
+    "torch>=2.6",
+    "datasets>=2.20",
+    "wandb>=0.18",
+
+    # Tokenizers — v1 uses tiktoken (GPT-2 BPE), v2 uses the Qwen3 tokenizer.json
+    "tiktoken>=0.7",
+    "tokenizers>=0.20",
+    "huggingface-hub>=0.24",
+
+    # Notebooks + plots
+    "ipykernel>=6.29",
+    "matplotlib>=3.9",
+]
+
+# Pin torch to PyTorch's CUDA 12.8 wheels (RTX 5090 / Blackwell needs cu128+).
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
