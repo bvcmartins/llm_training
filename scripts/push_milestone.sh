@@ -6,8 +6,8 @@
 # entry to MANIFEST.json so the commit can always locate the exact weights again.
 #
 # Prereqs (one-time, run by you — login is interactive and needs your HF token):
-#     uv tool install "huggingface_hub[cli]"      # or: pipx install huggingface_hub[cli]
-#     huggingface-cli login                        # paste a write token from hf.co/settings/tokens
+#     uv tool install "huggingface_hub[cli]"      # provides the `hf` CLI
+#     hf auth login                                # paste a write token from hf.co/settings/tokens
 #
 # Usage:
 #     scripts/push_milestone.sh --export models/v3/exports/espopip_hf [options]
@@ -23,6 +23,7 @@
 set -euo pipefail
 
 MODEL_NAME="espopip"
+HF_OWNER="bvcmartins"          # HF account; override the full id with --repo if this changes
 EXPORT="" ; REPO="" ; TAG="" ; STEP="" ; NOTE="" ; MANIFEST=""
 
 while [[ $# -gt 0 ]]; do
@@ -40,13 +41,11 @@ done
 [[ -n "$EXPORT" ]] || { echo "error: --export DIR is required" >&2; exit 2; }
 [[ -f "$EXPORT/model.safetensors" ]] || { echo "error: $EXPORT/model.safetensors not found — is this an HF export dir?" >&2; exit 2; }
 
-# Resolve repo id from the logged-in user if not given.
-if [[ -z "$REPO" ]]; then
-  USER="$(huggingface-cli whoami 2>/dev/null | head -1 || true)"
-  [[ -n "$USER" && "$USER" != "Not logged in"* ]] || {
-    echo "error: not logged in. Run 'huggingface-cli login', or pass --repo <user>/$MODEL_NAME" >&2; exit 1; }
-  REPO="$USER/$MODEL_NAME"
-fi
+# Default repo id. (whoami parsing is avoided: `hf auth whoami` prints a pretty,
+# multi-line form on a TTY that doesn't parse reliably.)
+[[ -n "$REPO" ]] || REPO="$HF_OWNER/$MODEL_NAME"
+hf auth whoami >/dev/null 2>&1 || {
+  echo "error: not logged in. Run 'hf auth login' first." >&2; exit 1; }
 
 # Default tag + manifest path.
 if [[ -z "$TAG" ]]; then
@@ -59,11 +58,11 @@ BYTES="$(stat -c%s "$EXPORT/model.safetensors")"
 NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 echo ">> uploading $EXPORT  ->  $REPO  (private)"
-huggingface-cli upload "$REPO" "$EXPORT" . --repo-type model --private \
+hf upload "$REPO" "$EXPORT" . --type model --private \
   --commit-message "milestone: $MODEL_NAME ${STEP:+step $STEP} ($TAG)"
 
 echo ">> tagging $REPO @ $TAG"
-huggingface-cli tag "$REPO" "$TAG" --repo-type model 2>/dev/null \
+hf repos tag create "$REPO" "$TAG" --type model -m "$MODEL_NAME ${STEP:+step $STEP}" 2>/dev/null \
   || echo "   (tag '$TAG' may already exist — skipping)"
 
 # Append a pointer record to MANIFEST.json (git-tracked).

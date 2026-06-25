@@ -30,19 +30,32 @@ from pathlib import Path
 
 import torch
 
-# notebooks/ lives under models/v2; src/ is its sibling.
-V2_DIR = Path(__file__).resolve().parent.parent
-SRC_DIR = V2_DIR / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from qwen3_model import QWEN3_CONFIG_0_6B, QWEN3_CONFIG_1_7B, Qwen3Model  # noqa: E402
-
-CONFIGS = {
-    "qwen3_model.QWEN3_CONFIG_0_6B": QWEN3_CONFIG_0_6B,
-    "qwen3_model.QWEN3_CONFIG_1_7B": QWEN3_CONFIG_1_7B,
-}
+# Default src/ is the sibling of this notebooks/ dir (models/v2/src). Override with
+# --src to export a checkpoint from another model version, e.g. models/v3/src for the
+# 1.5B (espopip) run — that dir defines QWEN3_CONFIG_1_5B which v2's does not.
+DEFAULT_SRC = Path(__file__).resolve().parent.parent / "src"
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+
+
+def load_src(src_dir: Path):
+    """Import the version's qwen3_model module from `src_dir` and return it."""
+    src_dir = src_dir.resolve()
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+    import qwen3_model  # noqa: PLC0415  (deferred: path set above)
+    return qwen3_model
+
+
+def resolve_config(module, ref: str) -> dict:
+    """Resolve a 'qwen3_model.QWEN3_CONFIG_X' ref against the imported module."""
+    attr = ref.split(".")[-1]
+    if not hasattr(module, attr):
+        raise SystemExit(
+            f"config '{attr}' not found in {module.__file__}.\n"
+            f"  The checkpoint was trained with model_config_ref={ref!r}; point --src at the "
+            f"matching version's src/ (e.g. models/v3/src for QWEN3_CONFIG_1_5B)."
+        )
+    return getattr(module, attr)
 
 
 def remap_state_dict(sd: dict, n_layers: int) -> dict:
@@ -107,9 +120,9 @@ def build_hf_config(cfg: dict, max_pos: int):
 
 
 @torch.no_grad()
-def verify(native_sd: dict, cfg: dict, hf_model, dtype, seq_len: int = 32, vocab_cap: int = 1000):
+def verify(model_cls, native_sd: dict, cfg: dict, hf_model, dtype, seq_len: int = 32, vocab_cap: int = 1000):
     """Build the native model, run both on the same batch, report max-abs logit diff."""
-    native = Qwen3Model(cfg).to(dtype)
+    native = model_cls(cfg).to(dtype)
     native.load_state_dict(native_sd, strict=True)
     native.eval()
 
@@ -123,10 +136,56 @@ def verify(native_sd: dict, cfg: dict, hf_model, dtype, seq_len: int = 32, vocab
     return diff, agree
 
 
+def write_model_card(out: Path, name: str, cfg: dict, ck: dict, n_params: int):
+    """Write a HF model card (README.md) so the repo self-identifies as `name`."""
+    stage = ck.get("stage", "unknown")
+    step = ck.get("step", "unknown")
+    card = f"""---
+license: apache-2.0
+library_name: transformers
+pipeline_tag: text-generation
+tags:
+- qwen3
+- from-scratch
+- pretraining
+---
+
+# {name}
+
+A from-scratch Qwen3-architecture causal language model, trained from random init
+(no distillation, no fine-tune of an existing checkpoint).
+
+- **Parameters:** {n_params/1e6:.0f}M (tied embeddings counted once)
+- **Architecture:** Qwen3 — GQA + per-head QK-norm, SwiGLU MLP, RMSNorm pre-norm, RoPE (theta={cfg['rope_base']:g})
+- **Layers / hidden / heads / kv-heads:** {cfg['n_layers']} / {cfg['emb_dim']} / {cfg['n_heads']} / {cfg['n_kv_groups']}
+- **Vocab:** {cfg['vocab_size']} (Qwen3 tokenizer)
+- **Export from:** stage `{stage}`, step `{step}`
+
+Weights are bit-for-bit verified to reproduce the native training model's logits.
+
+## Usage
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("{name}")
+model = AutoModelForCausalLM.from_pretrained("{name}", dtype="bfloat16")
+```
+"""
+    (out / "README.md").write_text(card)
+    print(f"Wrote model card -> {out / 'README.md'}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--name", default="espopip",
+                    help="Public model name. Sets config._name_or_path and the model-card title "
+                         "so the export self-identifies independently of the checkpoint/dir name.")
+    ap.add_argument("--src", type=Path, default=DEFAULT_SRC,
+                    help="Model version's src/ dir to import qwen3_model from. "
+                         f"Default: {DEFAULT_SRC}. Use models/v3/src for the 1.5B espopip run.")
     ap.add_argument("--tokenizer-repo", default="Qwen/Qwen3-0.6B-Base")
     ap.add_argument("--dtype", default="bfloat16", choices=list(DTYPES))
     ap.add_argument("--max-position-embeddings", type=int, default=40_960,
@@ -137,10 +196,13 @@ def main():
 
     dtype = DTYPES[args.dtype]
 
+    qwen3_model = load_src(args.src)
+    Qwen3Model = qwen3_model.Qwen3Model
+
     print(f"Loading checkpoint {args.ckpt} ...")
     ck = torch.load(args.ckpt, map_location="cpu", mmap=True, weights_only=False)
     ref = ck.get("model_config_ref", "qwen3_model.QWEN3_CONFIG_0_6B")
-    cfg = CONFIGS[ref]
+    cfg = resolve_config(qwen3_model, ref)
     sd = {k: v.to(dtype) for k, v in ck["model"].items()}
     print(f"  stage={ck.get('stage')} step={ck.get('step')} config={ref} "
           f"tensors={len(sd)} dtype->{args.dtype}")
@@ -152,6 +214,8 @@ def main():
     from transformers import AutoTokenizer, Qwen3ForCausalLM
 
     config = build_hf_config(cfg, args.max_position_embeddings)
+    # Self-identify as `args.name` rather than the checkpoint/output path.
+    config.name_or_path = args.name
     with torch.device("cpu"):
         model = Qwen3ForCausalLM(config).to(dtype)
     missing, unexpected = model.load_state_dict(hf_sd, strict=False)
@@ -166,7 +230,7 @@ def main():
 
     if not args.no_verify:
         print("Verifying against native model (logit parity) ...")
-        diff, agree = verify(sd, cfg, model, dtype)
+        diff, agree = verify(Qwen3Model, sd, cfg, model, dtype)
         print(f"  max|Δlogit|={diff:.3e}  top1-agreement={agree*100:.1f}%")
         if agree < 0.999:
             raise SystemExit("Verification FAILED: HF logits diverge from native model.")
@@ -177,6 +241,8 @@ def main():
     model.save_pretrained(args.out, safe_serialization=True)
     print(f"Saving tokenizer ({args.tokenizer_repo}) -> {args.out}")
     AutoTokenizer.from_pretrained(args.tokenizer_repo).save_pretrained(args.out)
+
+    write_model_card(args.out, args.name, cfg, ck, n)
 
     print("\nDone. Run benchmarks with:")
     print(f"  uv run lm_eval --model hf \\")
