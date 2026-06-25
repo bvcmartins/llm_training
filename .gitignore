@@ -1,5 +1,10 @@
 checkpoints/
 
+# HF exports — weights live on the Hub (espopip), git keeps only MANIFEST.json
+exports/
+*.pt
+*.safetensors
+
 # Python / uv
 .venv/
 __pycache__/

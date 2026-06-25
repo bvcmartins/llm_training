@@ -1,0 +1,72 @@
+# v3 scheduled training — crontab for user bmartins.
+#
+# GOAL: train ~22h/day on the laptop RTX 5090, but leave the GPU FREE during a
+# daily blackout 20:00-22:00 (8-10pm). The trainer checkpoints + resumes itself,
+# so chunked multi-week training "just works".
+#
+# Install:   crontab -l > /tmp/cur.txt 2>/dev/null; cat this file >> /tmp/cur.txt; crontab /tmp/cur.txt
+#       (or) crontab -e   and paste the lines below.
+# Verify:    crontab -l
+# Disable:   crontab -r   (removes ALL cron jobs — edit instead if you have others)
+#
+# Cron runs with a minimal environment; the scripts hard-code absolute paths and
+# call the venv python directly, so no PATH/venv setup is needed here.
+
+SHELL=/bin/bash
+
+# Launch/resume every 20 min. Self-noops during blackout and while a run already
+# holds the lock; restarts within ~20 min of any crash.
+*/20 * * * *  /home/bmartins/dev/llm_training/models/v3/scripts/train_session.sh
+
+# Hourly checkpoint prune (keeps last 3 + milestones + _final; each ~9 GB).
+# Needed because the launcher is blocked holding the lock during the long run.
+17 * * * *    /home/bmartins/dev/llm_training/models/v3/scripts/prune_checkpoints.sh
+
+# Hard backstop at 20:00: SIGTERM the run (graceful checkpoint) so the GPU is
+# guaranteed free for blackout even if --stop-at 19:55 slipped. Force-kills only
+# if it overruns the grace period.
+0 20 * * *    /home/bmartins/dev/llm_training/models/v3/scripts/stop_training.sh
+
+
+# -----------------------------------------------------------------------------
+# Timeline of a day:
+#   22:00  blackout ends; next */20 tick starts/resumes training (--auto-resume)
+#   ..     trains continuously, checkpointing every 500 steps; prunes hourly
+#   19:55  trainer self-stops (--stop-at), writes a resumable _step checkpoint
+#   20:00  blackout begins; backstop SIGTERM ensures the GPU is free; */20 ticks
+#          no-op until 22:00
+#
+# STAGE HANDOFF (pretrain -> anneal), done manually when pretrain finishes:
+#   1. The pretrain run that hits max_steps writes qwen3_v3_pretrain_final.pt.
+#   2. Seed the anneal stage once (fresh optimizer, carries counters/cursors):
+#        cd /home/bmartins/dev/llm_training/models/v3
+#        ../../.venv/bin/python src/run.py --stage anneal \
+#            --init-from checkpoints/qwen3_v3_pretrain_final.pt --stop-at 19:55
+#      (or run anneal.py --init-from ...; let it checkpoint a _step file).
+#   3. Edit STAGE=anneal in train_session.sh so the cron launcher resumes anneal.
+#
+# -----------------------------------------------------------------------------
+# ALTERNATIVE: systemd user units (more robust than cron — proper graceful stop
+# via TimeoutStopSec, journald logging, no flock stacking). Sketch:
+#
+#   ~/.config/systemd/user/v3-train.service
+#     [Service]
+#     Type=simple
+#     ExecStart=/home/bmartins/dev/llm_training/.venv/bin/python \
+#         /home/bmartins/dev/llm_training/models/v3/src/run.py \
+#         --stage pretrain --model 1.5b --auto-resume --stop-at 19:55
+#     KillSignal=SIGTERM
+#     TimeoutStopSec=480          # let the trainer checkpoint + exit
+#     Restart=on-failure
+#     RestartSec=60
+#
+#   ~/.config/systemd/user/v3-train.timer
+#     [Timer]
+#     OnCalendar=*-*-* 22:00:00    # start at blackout end
+#     Persistent=true
+#     [Install]
+#     WantedBy=timers.target
+#
+#   A separate v3-stop.timer at 20:00 runs `systemctl --user stop v3-train`
+#   (SIGTERM + TimeoutStopSec gives the same graceful checkpoint as stop_training.sh).
+#   Enable lingering so user units run while logged out:  loginctl enable-linger bmartins
