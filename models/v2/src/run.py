@@ -68,10 +68,11 @@ def main():
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     import torch
     from qwen3_model import Qwen3Model, QWEN3_CONFIG_0_6B, QWEN3_CONFIG_1_7B
-    from training import (
-        default_pretrain_config, default_anneal_config,
-        train_stage, load_resume_state, stage_cfg_from_dict,
-    )
+    from training import train_stage, load_resume_state, stage_cfg_from_dict
+    # Stage-config factories were moved out of training.py (the engine) and now
+    # live with their stage entrypoints.
+    from pretrain import default_pretrain_config
+    from anneal import default_anneal_config
 
     model_configs = {"0.6b": QWEN3_CONFIG_0_6B, "1.7b": QWEN3_CONFIG_1_7B}
 

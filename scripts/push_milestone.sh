@@ -41,6 +41,12 @@ done
 [[ -n "$EXPORT" ]] || { echo "error: --export DIR is required" >&2; exit 2; }
 [[ -f "$EXPORT/model.safetensors" ]] || { echo "error: $EXPORT/model.safetensors not found — is this an HF export dir?" >&2; exit 2; }
 
+# Auto-fill --step from the export provenance sidecar (written by export_hf.py) if not given.
+if [[ -z "$STEP" && -f "$EXPORT/.export_meta.json" ]]; then
+  STEP="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('step') or '')" "$EXPORT/.export_meta.json" 2>/dev/null || true)"
+  [[ -n "$STEP" ]] && echo ">> step $STEP (auto-detected from .export_meta.json)"
+fi
+
 # Default repo id. (whoami parsing is avoided: `hf auth whoami` prints a pretty,
 # multi-line form on a TTY that doesn't parse reliably.)
 [[ -n "$REPO" ]] || REPO="$HF_OWNER/$MODEL_NAME"
@@ -59,6 +65,7 @@ NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 echo ">> uploading $EXPORT  ->  $REPO  (private)"
 hf upload "$REPO" "$EXPORT" . --type model --private \
+  --exclude ".export_meta.json" \
   --commit-message "milestone: $MODEL_NAME ${STEP:+step $STEP} ($TAG)"
 
 echo ">> tagging $REPO @ $TAG"

@@ -244,6 +244,13 @@ def main():
 
     write_model_card(args.out, args.name, cfg, ck, n)
 
+    # Sidecar provenance so push_milestone.sh can auto-fill --step (excluded from upload).
+    import json
+    meta = {"name": args.name, "step": ck.get("step"), "stage": ck.get("stage"),
+            "model_config_ref": ref, "ckpt": str(args.ckpt)}
+    (args.out / ".export_meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    print(f"Wrote provenance -> {args.out / '.export_meta.json'} (step={meta['step']})")
+
     print("\nDone. Run benchmarks with:")
     print(f"  uv run lm_eval --model hf \\")
     print(f"    --model_args pretrained={args.out},dtype={args.dtype} \\")
