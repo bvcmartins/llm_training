@@ -1,0 +1,13 @@
+[
+  {
+    "model": "espopip",
+    "repo": "bvcmartins/espopip",
+    "revision": "step-7686",
+    "step": 7686,
+    "export_dir": "models/v3/exports/espopip_hf",
+    "safetensors_sha256": "1b3011937cfaceb9c47048d39f2738cb19c2cfc10ee5d2ac0fca51009e318429",
+    "safetensors_bytes": 3011043624,
+    "uploaded_utc": "2026-06-25T04:13:54Z",
+    "note": "stage1 pretrain"
+  }
+]
