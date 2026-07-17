@@ -60,6 +60,15 @@ SOURCES: dict[str, SourceSpec] = {
 SOURCE_IDS: dict[str, int] = {name: i for i, name in enumerate(SOURCES)}
 ID_TO_SOURCE: dict[int, str] = {i: name for name, i in SOURCE_IDS.items()}
 
+# Held-out validation contract: the FIRST VAL_HOLDOUT_DOCS documents of every
+# source are reserved for validation only. The training stream always skips this
+# prefix (see MultiSourcePackedDataset._build_stream), and the val stream only
+# ever reads inside it (SingleSourcePackedDataset), so train/val are disjoint.
+# Before this was added, val used `.take(val_docs)` over the *same* first docs the
+# trainer read from doc 0 — so "val loss" was an in-sample stale slice, not a
+# generalization signal.
+VAL_HOLDOUT_DOCS: int = 1_000
+
 
 # ---------------------------------------------------------------------------
 # Stage mixtures (Llama 3 style)
@@ -76,30 +85,38 @@ class StageMix:
 PRETRAIN_MIX = StageMix(
     name="pretrain",
     weights={
-        "fineweb_edu":   0.30,   # curated Common-Crawl (edu/science) backbone
+        "fineweb_edu":   0.33,   # curated Common-Crawl (edu/science) backbone
         "finemath":      0.15,   # math  ┐
         "math":          0.15,   #       ┘ = 0.30 math
-        "pes2o":         0.13,   # science papers ┐
-        "arxiv":         0.12,   #                ┘ = 0.25 science
+        "pes2o":         0.18,   # science papers ┐
+        "arxiv":         0.04,   #                ┘ = 0.22 science
         "stackoverflow": 0.08,   # code/reasoning
         "wiki":          0.05,
         "books":         0.02,
     },
 )
+# arxiv trimmed 0.12 -> 0.04 (2026-07-14): neuralwork/arxiver is only ~63k docs
+# (~0.9B tokens). At 0.12 over the 26B-token target it ran ~3 epochs; at 0.04 it
+# is ~1 epoch. The freed weight went to pes2o (common-pile/peS2o — a much larger
+# science-paper corpus) so the science tilt is preserved without looping a small
+# set. Per-wrap reshuffling (see MultiSourcePackedDataset._build_stream) makes a
+# marginal >1 epoch harmless; drop to 0.03 if you want strictly <1 epoch.
 
 ANNEAL_MIX = StageMix(
     name="anneal",
     weights={
         "finemath":      0.22,   # math  ┐
         "math":          0.18,   #       ┘ = 0.40 math
-        "pes2o":         0.18,   # science papers ┐
-        "arxiv":         0.12,   #                ┘ = 0.30 science
+        "pes2o":         0.25,   # science papers ┐
+        "arxiv":         0.05,   #                ┘ = 0.30 science
         "fineweb_edu":   0.15,
         "stackoverflow": 0.10,
         "wiki":          0.03,
         "books":         0.02,
     },
 )
+# arxiv trimmed 0.12 -> 0.05 here too (2026-07-14), same reason as PRETRAIN_MIX;
+# freed weight moved to pes2o to keep the science emphasis.
 
 
 # ---------------------------------------------------------------------------
@@ -147,16 +164,21 @@ class MultiSourcePackedDataset(IterableDataset):
     def docs_consumed(self) -> dict[str, int]:
         return dict(self._docs_consumed)
 
-    def _build_stream(self, spec: SourceSpec, skip: int):
+    def _build_stream(self, spec: SourceSpec, skip: int, epoch: int = 0):
         ds = load_dataset(
             spec.hf_path,
             name=spec.hf_config,
             split=spec.split,
             streaming=True,
         )
-        if skip:
-            ds = ds.skip(skip)
-        return ds.shuffle(buffer_size=self.shuffle_buffer, seed=self.seed)
+        # Always skip the reserved val holdout, then the resume cursor on top.
+        # `skip` is the training-region cursor (0-based *after* the holdout), so
+        # it stays consistent across resume and across a source-exhaustion wrap.
+        ds = ds.skip(VAL_HOLDOUT_DOCS + skip)
+        # Vary the shuffle order per wrap so a small source that loops (e.g. the
+        # ~63k-doc arxiv set) does not replay the identical sequence verbatim.
+        seed = self.seed + 7919 * epoch
+        return ds.shuffle(buffer_size=self.shuffle_buffer, seed=seed)
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         tok = get_tokenizer(self.tokenizer_repo)
@@ -168,6 +190,7 @@ class MultiSourcePackedDataset(IterableDataset):
             for name in self._source_names
         }
         buffers: dict[str, list[int]] = {n: [] for n in self._source_names}
+        epochs: dict[str, int] = {n: 0 for n in self._source_names}
         window  = self.context_length + 1
         rng     = random.Random(self.seed)
 
@@ -180,7 +203,8 @@ class MultiSourcePackedDataset(IterableDataset):
                 try:
                     row = next(streams[name])
                 except StopIteration:
-                    streams[name] = iter(self._build_stream(spec, 0))
+                    epochs[name] += 1
+                    streams[name] = iter(self._build_stream(spec, 0, epochs[name]))
                     self._docs_consumed[name] = 0
                     continue
                 text = row[spec.text_field]
@@ -220,12 +244,22 @@ class SingleSourcePackedDataset(IterableDataset):
         tok = get_tokenizer(self.tokenizer_repo)
         EOT = eot_id(self.tokenizer_repo)
 
+        # Representative val: sample from a SHUFFLE of the reserved holdout region
+        # (the first VAL_HOLDOUT_DOCS docs, which the trainer always skips), NOT
+        # the first `val_docs` in file order. A corpus's leading docs are often
+        # atypical (short stubs, alphabetical ordering) and boundary-heavy, so the
+        # old `.take(val_docs)` produced a val loss that ROSE even while true
+        # held-out perplexity FELL — a phantom "overfitting" signal. Shuffling
+        # inside the holdout keeps val DISJOINT from train (train starts at doc
+        # VAL_HOLDOUT_DOCS) while making it track generalization.
         ds = load_dataset(
             self.spec.hf_path,
             name=self.spec.hf_config,
             split=self.spec.split,
             streaming=True,
-        ).take(self.val_docs)
+        ).take(VAL_HOLDOUT_DOCS).shuffle(buffer_size=VAL_HOLDOUT_DOCS, seed=1234)
+        if self.val_docs < VAL_HOLDOUT_DOCS:
+            ds = ds.take(self.val_docs)
 
         window = self.context_length + 1
         buf: list[int] = []
@@ -265,6 +299,9 @@ def build_val_loaders(
     batch_size:     int,
     val_docs_per_source: int = 200,
 ) -> dict[str, DataLoader]:
+    # Val may only read inside the reserved holdout; clamp so it can never spill
+    # into the training region (which starts at doc VAL_HOLDOUT_DOCS).
+    val_docs_per_source = min(val_docs_per_source, VAL_HOLDOUT_DOCS)
     loaders = {}
     for name, spec in SOURCES.items():
         ds = SingleSourcePackedDataset(spec, context_length, val_docs_per_source)

@@ -5,6 +5,7 @@
 #   * single instance      — flock -n; a 2nd tick during a live run is a no-op.
 #   * GPU blackout guard    — local time in [20:00, 22:00) -> exit 0 (no training
 #                             during the user's daily 8-10pm GPU window).
+#   * completion guard      — once this stage's _final.pt exists, stop relaunching.
 #   * crash auto-restart    — if no run holds the lock, start/resume one.
 #   * graceful pre-blackout — --stop-at 19:55 makes the trainer checkpoint and
 #                             exit on its own ~5 min before blackout.
@@ -14,15 +15,17 @@
 # Net state machine: train 22:00 -> 19:55 (~22h), graceful checkpoint, GPU free
 # 20:00-22:00, auto-resume at 22:00, auto-restart within ~20 min of any crash.
 #
-# Switch stages by editing STAGE below (pretrain -> anneal) once pretrain's
-# _final.pt is produced; the anneal seed is handed off manually (see crontab.txt).
+# Stage-2 anneal has its OWN launcher (anneal_session.sh); this script only ever
+# runs pretrain. When pretrain writes its _final.pt the completion guard below
+# turns this into a no-op, and anneal_session.sh takes over (it waits for that
+# same _final.pt), so there is no manual STAGE edit at the handoff.
 set -uo pipefail
 
 # --- config ---------------------------------------------------------------
 ROOT=/home/bmartins/dev/llm_training
 V3="$ROOT/models/v3"
 PY="$ROOT/.venv/bin/python"
-STAGE=pretrain                 # pretrain | anneal  (edit when handing off)
+STAGE=pretrain                 # this launcher is pretrain-only (anneal_session.sh does anneal)
 MODEL=1.5b
 STOP_AT=19:55                  # graceful self-stop, ~5 min before blackout
 BLACKOUT_START=$((20 * 60))    # 20:00 in minutes-since-midnight
@@ -36,6 +39,15 @@ PRUNE="$V3/scripts/prune_checkpoints.sh"
 # cron tick costs nothing and never blocks a (non-existent) run.
 now=$((10#$(date +%H) * 60 + 10#$(date +%M)))
 if (( now >= BLACKOUT_START && now < BLACKOUT_END )); then
+    exit 0
+fi
+
+# --- completion guard -----------------------------------------------------
+# Once this stage has written its _final.pt, the stage is DONE. Stop relaunching
+# so the cron doesn't reload + re-evaluate the finished model every 20 min, and
+# so you never have to manually disable this line. The pretrain->anneal handoff
+# is picked up by anneal_session.sh, which waits for this same _final.pt.
+if [ -f "$V3/checkpoints/qwen3_v3_${STAGE}_final.pt" ]; then
     exit 0
 fi
 

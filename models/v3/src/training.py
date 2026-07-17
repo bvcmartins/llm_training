@@ -98,6 +98,7 @@ class StageConfig:
     ckpt_every:      int     = 500   # v3: 1.5B does far fewer steps/day than v2, so checkpoint more often for crash recovery (prune keeps disk bounded)
     val_docs_per_source: int = 200
     grad_checkpoint: bool    = True
+    compile:         bool    = False  # torch.compile the training forward (~1.17x on the 5090 laptop)
     sample_every:    int     = 500
     sample_prompt:   str     = "The quick brown fox"
     sample_max_new:  int     = 60
@@ -318,6 +319,15 @@ def train_stage(
     if hasattr(model, "enable_grad_checkpointing"):
         model.enable_grad_checkpointing(cfg.grad_checkpoint)
 
+    # Throughput: compile ONLY the training forward. Eval/sampling keep using the
+    # uncompiled `model` (sampling feeds growing sequences, which would otherwise
+    # trigger a recompile every token). Compiling is a one-time ~40s cost per
+    # process (so ~40s per daily resume — negligible vs a 22h session) for ~1.17x.
+    train_fwd = model
+    if cfg.compile:
+        log.info("compiling training forward with torch.compile (first step is slow)...")
+        train_fwd = torch.compile(model)
+
     optimizer = build_optimizer(model, lr=cfg.lr_peak, weight_decay=cfg.weight_decay)
 
     val_history: list = []
@@ -434,7 +444,7 @@ def train_stage(
             x, y, src = next(train_iter)
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                logits = model(x)
+                logits = train_fwd(x)
                 loss = F.cross_entropy(logits.flatten(0, 1), y.flatten()) / cfg.grad_accum
             loss.backward()
             running_loss += loss.item()

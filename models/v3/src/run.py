@@ -63,6 +63,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-wandb",   action="store_true")
     p.add_argument("--wandb-project", default="llm-training-v3")
     p.add_argument("--wandb-name",    default=None)
+    p.add_argument("--wandb-id",      default=None,
+                   help="stable W&B run id so every resume continues ONE run "
+                        "(default: qwen3_<model>_<stage>). Keeps the dashboard a "
+                        "single continuous curve per stage instead of a new run "
+                        "per session. Set --wandb-id fresh-<x> to start a new run.")
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                   help="torch.compile the training forward (~1.17x on the 5090; "
+                        "one-time ~40s compile per process). --no-compile to disable.")
     p.add_argument("--seed",       type=int, default=123)
     return p.parse_args()
 
@@ -158,6 +166,17 @@ def main():
                 f"Either match the stage, or use --init-from to start a new stage from these weights."
             )
         stage_cfg = stage_cfg_from_dict(saved_cfg)
+        # Keep the LR-schedule fields (lr_peak/lr_end/warmup/max_steps) from the
+        # saved cfg so the cosine curve stays continuous across resume. But the
+        # DATA MIXTURE and val sampling are NOT part of the schedule: freezing them
+        # means edits to PRETRAIN_MIX/ANNEAL_MIX (data.py) are silently ignored on
+        # every --resume (the mix stays whatever the very first checkpoint used —
+        # e.g. the arxiv 0.12->0.04 trim never took effect and arxiv looped past
+        # 1 epoch). Re-read them from the live config so mixture tuning actually
+        # applies to the next session.
+        live_cfg = build_stage_cfg()
+        stage_cfg.mix = live_cfg.mix
+        stage_cfg.val_docs_per_source = live_cfg.val_docs_per_source
     else:
         stage_cfg = build_stage_cfg()
 
@@ -169,6 +188,9 @@ def main():
     stage_cfg.model_tag = "qwen3_v3"
     stage_cfg.model_config_ref = f"qwen3_model.QWEN3_CONFIG_{args.model.upper().replace('.', '_')}"
     stage_cfg.stop_at = args.stop_at
+    # Live arg, like stop_at: resuming a checkpoint saved before this field existed
+    # (e.g. step 17893) would otherwise default compile off.
+    stage_cfg.compile = args.compile
 
     # If --init-from, load weights only (fresh optimizer). train_stage's
     # resume_from path is only for same-stage resume, so do this here.
@@ -180,9 +202,18 @@ def main():
     wandb_run = None
     if not args.no_wandb:
         import wandb
+        # ONE continuous run per (model, stage): a deterministic id + resume="allow"
+        # means every daily session and every --resume appends to the SAME run, so
+        # pretrain is a single unbroken dashboard curve (and anneal is its own,
+        # separate run). Sanitise the id — W&B ids allow [A-Za-z0-9_-] (no dots).
+        default_id = f"qwen3_{args.model}_{args.stage}".replace(".", "_")
+        run_id = args.wandb_id or default_id
         wandb_run = wandb.init(
             project=args.wandb_project,
-            name=args.wandb_name or f"qwen3_{args.model}_{args.stage}",
+            id=run_id,
+            name=args.wandb_name or default_id,
+            resume="allow",         # resume run_id if it exists, else create it
+            group=f"qwen3_{args.model}_{args.stage}",  # groups any legacy per-session runs too
             config={
                 "model_config": model_cfg,
                 "stage":        args.stage,
