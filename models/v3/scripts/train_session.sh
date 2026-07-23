@@ -28,6 +28,10 @@ PY="$ROOT/.venv/bin/python"
 STAGE=pretrain                 # this launcher is pretrain-only (anneal_session.sh does anneal)
 MODEL=1.5b
 STOP_AT=19:55                  # graceful self-stop, ~5 min before blackout
+WANDB_PROJECT=dense-model-1.5b-v3  # own branding, not the base arch's name
+WANDB_ID=pretrain              # fresh restart 2026-07-17 (step-0 rerun). Stable id so
+WANDB_NAME=pretrain            # every daily session continues THIS run. Prior qwen-named
+                               # run (steps 0-19000) is left intact in its old project.
 BLACKOUT_START=$((20 * 60))    # 20:00 in minutes-since-midnight
 BLACKOUT_END=$((22 * 60))      # 22:00
 LOCK=/tmp/v3_train.lock
@@ -79,6 +83,8 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONUNBUFFERED=1 \
     "$PY" "$V3/src/run.py" \
         --stage "$STAGE" --model "$MODEL" \
         --auto-resume --stop-at "$STOP_AT" \
+        --wandb-project "$WANDB_PROJECT" \
+        --wandb-id "$WANDB_ID" --wandb-name "$WANDB_NAME" \
         >>"$LOG" 2>&1
 
 rc=$?

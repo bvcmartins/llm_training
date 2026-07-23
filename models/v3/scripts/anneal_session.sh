@@ -22,6 +22,9 @@ PY="$ROOT/.venv/bin/python"
 STAGE=anneal
 MODEL=1.5b
 STOP_AT=19:55
+WANDB_PROJECT=dense-model-1.5b-v3  # own branding, not the base arch's name (matches
+WANDB_ID=anneal                # train_session.sh). Anneal is its own run in the same
+WANDB_NAME=anneal              # project; stable id so daily sessions continue THIS run.
 BLACKOUT_START=$((20 * 60))
 BLACKOUT_END=$((22 * 60))
 LOCK=/tmp/v3_anneal.lock
@@ -73,6 +76,8 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONUNBUFFERED=1 \
     "$PY" "$V3/src/run.py" \
         --stage "$STAGE" --model "$MODEL" \
         "${SEED[@]}" --stop-at "$STOP_AT" \
+        --wandb-project "$WANDB_PROJECT" \
+        --wandb-id "$WANDB_ID" --wandb-name "$WANDB_NAME" \
         >>"$LOG" 2>&1
 
 rc=$?
