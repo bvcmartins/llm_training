@@ -1,8 +1,8 @@
 # v3 scheduled training — crontab for user bmartins.
 #
-# GOAL: train ~22h/day on the laptop RTX 5090, but leave the GPU FREE during a
-# daily blackout 20:00-22:00 (8-10pm). The trainer checkpoints + resumes itself,
-# so chunked multi-week training "just works".
+# GOAL: train overnight on the laptop RTX 5090 (22:00 -> 09:00, ~11h/day), but
+# leave the GPU FREE during the day (09:00-22:00). The trainer checkpoints +
+# resumes itself, so chunked multi-week training "just works".
 #
 # Install:   crontab -l > /tmp/cur.txt 2>/dev/null; cat this file >> /tmp/cur.txt; crontab /tmp/cur.txt
 #       (or) crontab -e   and paste the lines below.
@@ -14,36 +14,41 @@
 
 SHELL=/bin/bash
 
-# Launch/resume every 20 min. Self-noops during blackout and while a run already
-# holds the lock; restarts within ~20 min of any crash.
+# Launch/resume every 20 min. Self-noops during the daytime GPU-free window and
+# while a run already holds the lock; restarts within ~20 min of any crash.
 */20 * * * *  /home/bmartins/dev/llm_training/models/v3/scripts/train_session.sh
+# Stage-2 ANNEAL launcher — self-guards (waits for pretrain _final, seeds+continues,
+# stops at anneal _final). Safe to enable anytime, even during pretrain (no-ops until
+# pretrain finishes). Uncomment when you want the auto-handoff:
+# */20 * * * *  /home/bmartins/dev/llm_training/models/v3/scripts/anneal_session.sh
 
 # Hourly checkpoint prune (keeps last 3 + milestones + _final; each ~9 GB).
 # Needed because the launcher is blocked holding the lock during the long run.
 17 * * * *    /home/bmartins/dev/llm_training/models/v3/scripts/prune_checkpoints.sh
 
-# Hard backstop at 20:00: SIGTERM the run (graceful checkpoint) so the GPU is
-# guaranteed free for blackout even if --stop-at 19:55 slipped. Force-kills only
+# Hard backstop at 09:00: SIGTERM the run (graceful checkpoint) so the GPU is
+# guaranteed free for the day even if --stop-at 08:55 slipped. Force-kills only
 # if it overruns the grace period.
-0 20 * * *    /home/bmartins/dev/llm_training/models/v3/scripts/stop_training.sh
+0 9 * * *     /home/bmartins/dev/llm_training/models/v3/scripts/stop_training.sh
 
 
 # -----------------------------------------------------------------------------
 # Timeline of a day:
-#   22:00  blackout ends; next */20 tick starts/resumes training (--auto-resume)
-#   ..     trains continuously, checkpointing every 500 steps; prunes hourly
-#   19:55  trainer self-stops (--stop-at), writes a resumable _step checkpoint
-#   20:00  blackout begins; backstop SIGTERM ensures the GPU is free; */20 ticks
-#          no-op until 22:00
+#   22:00  daytime window ends; next */20 tick starts/resumes training (--auto-resume)
+#   ..     trains overnight, checkpointing every 500 steps; prunes hourly
+#   08:55  trainer self-stops (--stop-at), writes a resumable _step checkpoint
+#   09:00  daytime GPU-free window begins; backstop SIGTERM ensures the GPU is
+#          free; */20 ticks no-op until 22:00
 #
 # STAGE HANDOFF (pretrain -> anneal), done manually when pretrain finishes:
 #   1. The pretrain run that hits max_steps writes qwen3_v3_pretrain_final.pt.
 #   2. Seed the anneal stage once (fresh optimizer, carries counters/cursors):
 #        cd /home/bmartins/dev/llm_training/models/v3
 #        ../../.venv/bin/python src/run.py --stage anneal \
-#            --init-from checkpoints/qwen3_v3_pretrain_final.pt --stop-at 19:55
+#            --init-from checkpoints/qwen3_v3_pretrain_final.pt --stop-at 08:55
 #      (or run anneal.py --init-from ...; let it checkpoint a _step file).
-#   3. Edit STAGE=anneal in train_session.sh so the cron launcher resumes anneal.
+#   3. (SUPERSEDED 2026-07-14) No STAGE edit needed — anneal has its own launcher
+#      (anneal_session.sh); just uncomment its cron line above. Handoff is automatic.
 #
 # -----------------------------------------------------------------------------
 # ALTERNATIVE: systemd user units (more robust than cron — proper graceful stop
@@ -54,7 +59,7 @@ SHELL=/bin/bash
 #     Type=simple
 #     ExecStart=/home/bmartins/dev/llm_training/.venv/bin/python \
 #         /home/bmartins/dev/llm_training/models/v3/src/run.py \
-#         --stage pretrain --model 1.5b --auto-resume --stop-at 19:55
+#         --stage pretrain --model 1.5b --auto-resume --stop-at 08:55
 #     KillSignal=SIGTERM
 #     TimeoutStopSec=480          # let the trainer checkpoint + exit
 #     Restart=on-failure
@@ -62,11 +67,23 @@ SHELL=/bin/bash
 #
 #   ~/.config/systemd/user/v3-train.timer
 #     [Timer]
-#     OnCalendar=*-*-* 22:00:00    # start at blackout end
+#     OnCalendar=*-*-* 22:00:00    # start at the overnight window
 #     Persistent=true
 #     [Install]
 #     WantedBy=timers.target
 #
-#   A separate v3-stop.timer at 20:00 runs `systemctl --user stop v3-train`
+#   A separate v3-stop.timer at 09:00 runs `systemctl --user stop v3-train`
 #   (SIGTERM + TimeoutStopSec gives the same graceful checkpoint as stop_training.sh).
 #   Enable lingering so user units run while logged out:  loginctl enable-linger bmartins
+
+# Pre-relaunch GPU sweep at 21:59: clear any leftover daytime inference
+# (vLLM/ollama/etc.) so the 22:00 --auto-resume has the full 24 GiB. Guarded
+# to never kill the trainer; training is not running during the 09:00-22:00 day.
+59 21 * * *    /home/bmartins/dev/llm_training/models/v3/scripts/clear_gpu.sh
+
+# -----------------------------------------------------------------------------
+# Daily NAV snapshot (quest_portfolio): record summed Questrade totalEquity so the
+# NAV series + monthly/quarterly averages stay gap-free even when the dashboard
+# isn't opened. 14:30 MDT weekdays = 30 min after the 16:00 ET market close.
+# Rootless podman needs XDG_RUNTIME_DIR; idempotent per-day upsert if it double-runs.
+30 14 * * 1-5  XDG_RUNTIME_DIR=/run/user/1000 /usr/bin/podman exec quest-portfolio python /app/src/nav_snapshot.py >> /home/bmartins/Data/quest_data/nav_cron.log 2>&1

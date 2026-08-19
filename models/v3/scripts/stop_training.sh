@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Backstop graceful stop for the v3 trainer.
 #
-# The trainer normally self-stops at --stop-at 19:55 (checked at the top of each
+# The trainer normally self-stops at --stop-at 08:55 (checked at the top of each
 # optimizer step). This script is the safety net: SIGTERM the run so it flushes
 # a resumable checkpoint and exits, then SIGKILL only if it overruns the grace
-# period. Run from cron at 20:00 to *guarantee* the GPU is free for blackout.
+# period. Run from cron at 09:00 to *guarantee* the GPU is free for the day.
 #
 # A single 1.5B optimizer step can take a few minutes, and the trainer only acts
 # on the stop request at the next step boundary, so the grace period is generous.

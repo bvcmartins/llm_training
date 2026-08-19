@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # v3 ANNEAL launcher (idempotent, cron-friendly) — the stage-2 counterpart to
-# train_session.sh. Same 22h/day + 20:00-22:00 blackout model, but its OWN lock
+# train_session.sh. Same overnight 22:00->09:00 + daytime GPU-free model, but its OWN lock
 # and its OWN self-sequencing guards, so the pretrain->anneal handoff needs no
 # manual cron surgery:
 #
@@ -21,11 +21,11 @@ V3="$ROOT/models/v3"
 PY="$ROOT/.venv/bin/python"
 STAGE=anneal
 MODEL=1.5b
-STOP_AT=19:55
+STOP_AT=08:55
 WANDB_PROJECT=dense-model-1.5b-v3  # own branding, not the base arch's name (matches
 WANDB_ID=anneal                # train_session.sh). Anneal is its own run in the same
 WANDB_NAME=anneal              # project; stable id so daily sessions continue THIS run.
-BLACKOUT_START=$((20 * 60))
+BLACKOUT_START=$((9 * 60))
 BLACKOUT_END=$((22 * 60))
 LOCK=/tmp/v3_anneal.lock
 LOGDIR="$V3/logs"
@@ -34,7 +34,7 @@ PRETRAIN_FINAL="$CKPT/qwen3_v3_pretrain_final.pt"
 ANNEAL_FINAL="$CKPT/qwen3_v3_anneal_final.pt"
 PRUNE="$V3/scripts/prune_checkpoints.sh"
 
-# --- blackout guard -------------------------------------------------------
+# --- GPU-free-window guard ------------------------------------------------
 now=$((10#$(date +%H) * 60 + 10#$(date +%M)))
 if (( now >= BLACKOUT_START && now < BLACKOUT_END )); then
     exit 0

@@ -3,17 +3,17 @@
 #
 # Run every ~20 min from cron. Behaviour:
 #   * single instance      — flock -n; a 2nd tick during a live run is a no-op.
-#   * GPU blackout guard    — local time in [20:00, 22:00) -> exit 0 (no training
-#                             during the user's daily 8-10pm GPU window).
+#   * GPU-free guard        — local time in [09:00, 22:00) -> exit 0 (no training
+#                             during the user's daytime GPU window, 9am-10pm).
 #   * completion guard      — once this stage's _final.pt exists, stop relaunching.
 #   * crash auto-restart    — if no run holds the lock, start/resume one.
-#   * graceful pre-blackout — --stop-at 19:55 makes the trainer checkpoint and
-#                             exit on its own ~5 min before blackout.
+#   * graceful pre-window   — --stop-at 08:55 makes the trainer checkpoint and
+#                             exit on its own ~5 min before the daytime window.
 #   * --auto-resume         — continue the newest qwen3_v3_<stage>_step*.pt, or
 #                             start fresh if none exist.
 #
-# Net state machine: train 22:00 -> 19:55 (~22h), graceful checkpoint, GPU free
-# 20:00-22:00, auto-resume at 22:00, auto-restart within ~20 min of any crash.
+# Net state machine: train 22:00 -> 08:55 (~11h overnight), graceful checkpoint,
+# GPU free 09:00-22:00, auto-resume at 22:00, auto-restart within ~20 min of any crash.
 #
 # Stage-2 anneal has its OWN launcher (anneal_session.sh); this script only ever
 # runs pretrain. When pretrain writes its _final.pt the completion guard below
@@ -27,20 +27,22 @@ V3="$ROOT/models/v3"
 PY="$ROOT/.venv/bin/python"
 STAGE=pretrain                 # this launcher is pretrain-only (anneal_session.sh does anneal)
 MODEL=1.5b
-STOP_AT=19:55                  # graceful self-stop, ~5 min before blackout
+STOP_AT=08:55                  # graceful self-stop, ~5 min before the daytime window
 WANDB_PROJECT=dense-model-1.5b-v3  # own branding, not the base arch's name
 WANDB_ID=pretrain              # fresh restart 2026-07-17 (step-0 rerun). Stable id so
 WANDB_NAME=pretrain            # every daily session continues THIS run. Prior qwen-named
                                # run (steps 0-19000) is left intact in its old project.
-BLACKOUT_START=$((20 * 60))    # 20:00 in minutes-since-midnight
-BLACKOUT_END=$((22 * 60))      # 22:00
+BLACKOUT_START=$((9 * 60))     # 09:00 in minutes-since-midnight (daytime GPU-free window start)
+BLACKOUT_END=$((22 * 60))      # 22:00 (window end; training resumes)
 LOCK=/tmp/v3_train.lock
 LOGDIR="$V3/logs"
 PRUNE="$V3/scripts/prune_checkpoints.sh"
 
-# --- blackout guard -------------------------------------------------------
-# Done before taking the lock: during blackout this is a pure no-op so the
-# cron tick costs nothing and never blocks a (non-existent) run.
+# --- GPU-free-window guard ------------------------------------------------
+# Done before taking the lock: during the daytime window this is a pure no-op
+# so the cron tick costs nothing and never blocks a (non-existent) run. The
+# free window [09:00, 22:00) does not wrap midnight, so the overnight training
+# window 22:00 -> 09:00 is simply "not in [09:00, 22:00)".
 now=$((10#$(date +%H) * 60 + 10#$(date +%M)))
 if (( now >= BLACKOUT_START && now < BLACKOUT_END )); then
     exit 0
