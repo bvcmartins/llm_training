@@ -22,14 +22,15 @@ PY="$ROOT/.venv/bin/python"
 STAGE=anneal
 MODEL=1.5b
 STOP_AT=08:55
-WANDB_PROJECT=dense-model-1.5b-v3  # own branding, not the base arch's name (matches
-WANDB_ID=anneal                # train_session.sh). Anneal is its own run in the same
-WANDB_NAME=anneal              # project; stable id so daily sessions continue THIS run.
 BLACKOUT_START=$((9 * 60))
 BLACKOUT_END=$((22 * 60))
 LOCK=/tmp/v3_anneal.lock
 LOGDIR="$V3/logs"
 CKPT="$V3/checkpoints"
+MLFLOW_EXPERIMENT=dense-model-1.5b-v3  # own branding, not the base arch's name (matches
+MLFLOW_RUN_ID_FILE="$CKPT/.mlflow_run_id_anneal"  # train_session.sh). Anneal is its own
+MLFLOW_RUN_NAME=anneal         # run in the same experiment; persisted id file so daily
+                               # sessions continue THIS run.
 PRETRAIN_FINAL="$CKPT/qwen3_v3_pretrain_final.pt"
 ANNEAL_FINAL="$CKPT/qwen3_v3_anneal_final.pt"
 PRUNE="$V3/scripts/prune_checkpoints.sh"
@@ -76,8 +77,8 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONUNBUFFERED=1 \
     "$PY" "$V3/src/run.py" \
         --stage "$STAGE" --model "$MODEL" \
         "${SEED[@]}" --stop-at "$STOP_AT" \
-        --wandb-project "$WANDB_PROJECT" \
-        --wandb-id "$WANDB_ID" --wandb-name "$WANDB_NAME" \
+        --mlflow-experiment "$MLFLOW_EXPERIMENT" \
+        --mlflow-run-id-file "$MLFLOW_RUN_ID_FILE" --mlflow-run-name "$MLFLOW_RUN_NAME" \
         >>"$LOG" 2>&1
 
 rc=$?
