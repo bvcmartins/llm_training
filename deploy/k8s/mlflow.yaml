@@ -1,0 +1,76 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mlflow-storage
+  namespace: mlflow
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path        # k3s ships local-path-provisioner as default
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow-server
+  namespace: mlflow
+  labels: { app: mlflow-server }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }        # single RWO volume + SQLite — never run two pods at once
+  selector:
+    matchLabels: { app: mlflow-server }
+  template:
+    metadata:
+      labels: { app: mlflow-server }
+    spec:
+      containers:
+        - name: mlflow-server
+          image: ghcr.io/mlflow/mlflow:v3.15.2
+          command:
+            - mlflow
+            - server
+            - --backend-store-uri
+            - sqlite:////mlflow-data/mlflow.db
+            - --default-artifact-root
+            - /mlflow-data/artifacts
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "5000"
+            - --allowed-hosts
+            - "airig.local,airig.local:5000"
+          ports:
+            - { name: http, containerPort: 5000 }
+          volumeMounts:
+            - { name: storage, mountPath: /mlflow-data }
+          readinessProbe:
+            httpGet: { path: /health, port: 5000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 5000 }
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "100m", memory: "512Mi" }
+            limits:   { memory: "2Gi" }
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: mlflow-storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow-server
+  namespace: mlflow
+spec:
+  # LoadBalancer => k3s ServiceLB (klipper) binds host port 5000, so the server is
+  # reachable at http://airig.local:5000 — same pattern as ragu's :8600.
+  type: LoadBalancer
+  selector: { app: mlflow-server }
+  ports:
+    - { name: http, port: 5000, targetPort: 5000 }
