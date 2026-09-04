@@ -9,6 +9,7 @@ dependencies = [
     "torch>=2.6",
     "datasets>=2.20",
     "wandb>=0.18",
+    "mlflow>=3.15,<4",
 
     # Tokenizers — v1 uses tiktoken (GPT-2 BPE), v2 uses the Qwen3 tokenizer.json
     "tiktoken>=0.7",
