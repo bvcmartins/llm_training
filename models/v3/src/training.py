@@ -6,7 +6,7 @@ Two stages, Llama 3 style:
                 linear LR decay from the pretrain end-LR to 0.
 
 The same `train_stage(...)` function runs both — the stage is just a config.
-Every wandb log line and every checkpoint carries the stage name so the
+Every mlflow log line and every checkpoint carries the stage name so the
 training-data identity of any model state is unambiguous.
 """
 
@@ -23,7 +23,6 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
 
 from data import (
     StageMix, PRETRAIN_MIX, ANNEAL_MIX,
@@ -32,6 +31,7 @@ from data import (
 )
 from eval import evaluate_per_domain, PlateauDetector
 from logging_utils import gpu_mem_str, log_config
+from mlflow_utils import log_metrics_safe
 from tokenizer import encode, decode, eot_id
 
 # Shared engine logger. Entrypoints (pretrain.py / anneal.py) attach the
@@ -95,7 +95,7 @@ class StageConfig:
     grad_clip:       float   = 1.0
     eval_every:      int     = 250
     eval_batches:    int     = 20
-    ckpt_every:      int     = 500   # v3: 1.5B does far fewer steps/day than v2, so checkpoint more often for crash recovery (prune keeps disk bounded)
+    ckpt_every:      int     = 25    # MUST be reachable within one blackout-bounded session. A slow session (see 2026-08 throughput regression) advanced only ~54 steps/day; at ckpt_every=500 it never crossed a boundary, so no checkpoint was ever written and every day re-did & lost the same steps (resume-from-14052 groundhog loop). 25 guarantees ≥1 save/session even on a bad day. Disk stays bounded regardless — prune keeps only the 3 newest step ckpts + milestones.
     val_docs_per_source: int = 200
     grad_checkpoint: bool    = True
     compile:         bool    = False  # torch.compile the training forward (~1.17x on the 5090 laptop)
@@ -299,7 +299,7 @@ def train_stage(
     cfg:             StageConfig,
     device:          torch.device,
     ckpt_dir:        Path,
-    wandb_run=None,
+    mlflow_enabled:  bool                 = False,
     starting_step:   int                  = 0,
     starting_tokens: int                  = 0,
     skip_docs:       dict[str, int] | None = None,
@@ -364,11 +364,6 @@ def train_stage(
     def _on_plateau(payload):
         log.warning("[plateau:%s] best=%.4f current=%.4f — val stopped improving",
                     cfg.name, payload["best"], payload["current"])
-        if wandb_run is not None:
-            wandb_run.alert(
-                title=f"Plateau in {cfg.name}",
-                text=f"best={payload['best']:.4f} current={payload['current']:.4f}",
-            )
 
     detector = PlateauDetector(patience=5, min_delta=1e-3, cooldown=5, on_fire=_on_plateau)
 
@@ -486,8 +481,8 @@ def train_stage(
             "eta_hours":  eta_s / 3600.0,
             **{f"src_tokens/{k}": v for k, v in tokens_per_source.items()},
         }
-        if wandb_run is not None:
-            wandb_run.log(metrics, step=step)
+        if mlflow_enabled:
+            log_metrics_safe(metrics, step=step)
         log.info(
             f"[{cfg.name} {local}/{cfg.max_steps} gstep={step}] "
             f"loss={running_loss:.4f} ppl={train_ppl:,.1f} lr={lr:.2e} "
@@ -504,11 +499,10 @@ def train_stage(
             t_eval = time.time()
             val = evaluate_per_domain(model, val_loaders, device, max_batches=cfg.eval_batches)
             val_history.append({"step": step, "stage": cfg.name, **val})
-            if wandb_run is not None:
+            if mlflow_enabled:
                 val_log = {f"val/{k}": v for k, v in val.items()}
                 val_log |= {f"val_ppl/{k}": _safe_ppl(v) for k, v in val.items()}
-                val_log["stage"] = cfg.name
-                wandb_run.log(val_log, step=step)
+                log_metrics_safe(val_log, step=step)
             per_domain = "  ".join(f"{k}={v:.3f}" for k, v in val.items() if k != "aggregate")
             log.info(
                 f"[{cfg.name} eval gstep={step}] aggregate={val['aggregate']:.4f} "
@@ -527,11 +521,6 @@ def train_stage(
             )
             pretty = text.replace("<|endoftext|>", " ⏎ ")
             log.info(f"[{cfg.name} sample gstep={step}] {pretty}")
-            if wandb_run is not None:
-                wandb_run.log(
-                    {"train/sample": wandb.Html(f"<pre>{pretty}</pre>")},
-                    step=step,
-                )
 
         # Checkpoint
         if local > 0 and local % cfg.ckpt_every == 0:
@@ -583,11 +572,10 @@ def train_stage(
              local, _fmt_dur(time.time() - t_stage))
     val = evaluate_per_domain(model, val_loaders, device, max_batches=cfg.eval_batches)
     val_history.append({"step": step, "stage": cfg.name, **val})
-    if wandb_run is not None:
+    if mlflow_enabled:
         final_log = {f"val/{k}": v for k, v in val.items()}
         final_log |= {f"val_ppl/{k}": _safe_ppl(v) for k, v in val.items()}
-        final_log["stage"] = cfg.name
-        wandb_run.log(final_log, step=step)
+        log_metrics_safe(final_log, step=step)
     final_path = ckpt_dir / f"{cfg.model_tag}_{cfg.name}_final.pt"
     save_checkpoint(
         final_path, model, optimizer, cfg, step, tokens,
