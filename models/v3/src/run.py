@@ -60,18 +60,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-every", type=int, default=None)
     p.add_argument("--ckpt-every", type=int, default=None)
 
-    p.add_argument("--no-wandb",   action="store_true")
-    p.add_argument("--wandb-project", default="llm-training-v3")
-    p.add_argument("--wandb-name",    default=None)
-    p.add_argument("--wandb-id",      default=None,
-                   help="stable W&B run id so every resume continues ONE run "
-                        "(default: qwen3_<model>_<stage>). Keeps the dashboard a "
+    p.add_argument("--no-mlflow",   action="store_true")
+    p.add_argument("--mlflow-experiment", default="dense-model-1.5b-v3")
+    p.add_argument("--mlflow-run-name",   default=None)
+    p.add_argument("--mlflow-run-id-file", type=Path, default=None,
+                   help="path to a file holding the persisted MLflow run id, so "
+                        "every resume continues ONE run (default: "
+                        "<ckpt-dir>/.mlflow_run_id_<stage>). Keeps the dashboard a "
                         "single continuous curve per stage instead of a new run "
-                        "per session. Set --wandb-id fresh-<x> to start a new run.")
+                        "per session. Delete the file to start a fresh run.")
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
                    help="torch.compile the training forward (~1.17x on the 5090; "
                         "one-time ~40s compile per process). --no-compile to disable.")
     p.add_argument("--seed",       type=int, default=123)
+    p.add_argument("--allow-cpu", action="store_true",
+                   help="Permit training on CPU. By default run.py ABORTS if CUDA is "
+                        "unavailable — a driver/kernel-module mismatch (e.g. a kernel "
+                        "update without a reboot) silently falls back to CPU and wastes "
+                        "a whole scheduled session at ~1/100th throughput. Only pass this "
+                        "for a deliberate CPU debug run.")
     return p.parse_args()
 
 
@@ -103,6 +110,7 @@ def main():
     # live with their stage entrypoints.
     from pretrain import default_pretrain_config
     from anneal import default_anneal_config
+    from mlflow_utils import init_mlflow, end_run_safe
 
     model_configs = {
         "0.6b": QWEN3_CONFIG_0_6B, "1.5b": QWEN3_CONFIG_1_5B, "1.7b": QWEN3_CONFIG_1_7B,
@@ -118,6 +126,19 @@ def main():
         else:
             print(f"[auto-resume] no qwen3_v3_{args.stage}_step*.pt in {args.ckpt_dir} — fresh start")
 
+    # Hard GPU guard: a driver/kernel-module mismatch (Error 804 / "Can't initialize
+    # NVML", typically a kernel update without a reboot) makes torch.cuda.is_available()
+    # return False. The trainer would then silently run on CPU — the loop still "works"
+    # and wandb keeps syncing, so a full scheduled session (~22h) burns with ~zero
+    # progress before anyone notices (happened 2026-07-25). Fail LOUD instead unless a
+    # CPU run was explicitly requested.
+    if not torch.cuda.is_available() and not args.allow_cpu:
+        raise SystemExit(
+            "FATAL: CUDA is not available — refusing to train on CPU (would waste the "
+            "session at ~1/100th throughput). This usually means an NVIDIA driver/"
+            "kernel-module mismatch; reboot (or reload the nvidia module) and retry. "
+            "Pass --allow-cpu only for a deliberate CPU debug run."
+        )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
     if device.type == "cuda":
@@ -168,15 +189,19 @@ def main():
         stage_cfg = stage_cfg_from_dict(saved_cfg)
         # Keep the LR-schedule fields (lr_peak/lr_end/warmup/max_steps) from the
         # saved cfg so the cosine curve stays continuous across resume. But the
-        # DATA MIXTURE and val sampling are NOT part of the schedule: freezing them
-        # means edits to PRETRAIN_MIX/ANNEAL_MIX (data.py) are silently ignored on
-        # every --resume (the mix stays whatever the very first checkpoint used —
+        # DATA MIXTURE, val sampling, and CHECKPOINT CADENCE are NOT part of the
+        # schedule: freezing them means edits to those knobs are silently ignored on
+        # every --resume (the value stays whatever the very first checkpoint used —
         # e.g. the arxiv 0.12->0.04 trim never took effect and arxiv looped past
-        # 1 epoch). Re-read them from the live config so mixture tuning actually
-        # applies to the next session.
+        # 1 epoch; likewise a ckpt_every 500->25 edit never applied, so a slow
+        # session never crossed the 500-step boundary and no checkpoint was ever
+        # written -> the resume-from-14052 groundhog loop, see the gpu-power-cap
+        # memory). Re-read them from the live config so tuning actually applies to
+        # the next session.
         live_cfg = build_stage_cfg()
         stage_cfg.mix = live_cfg.mix
         stage_cfg.val_docs_per_source = live_cfg.val_docs_per_source
+        stage_cfg.ckpt_every = live_cfg.ckpt_every
     else:
         stage_cfg = build_stage_cfg()
 
@@ -198,31 +223,29 @@ def main():
         load_resume_state(args.init_from, model, optimizer=None)
         print(f"initialized model weights from {args.init_from.name}")
 
-    # wandb
-    wandb_run = None
-    if not args.no_wandb:
-        import wandb
-        # ONE continuous run per (model, stage): a deterministic id + resume="allow"
-        # means every daily session and every --resume appends to the SAME run, so
-        # pretrain is a single unbroken dashboard curve (and anneal is its own,
-        # separate run). Sanitise the id — W&B ids allow [A-Za-z0-9_-] (no dots).
-        default_id = f"qwen3_{args.model}_{args.stage}".replace(".", "_")
-        run_id = args.wandb_id or default_id
-        wandb_run = wandb.init(
-            project=args.wandb_project,
-            id=run_id,
-            name=args.wandb_name or default_id,
-            resume="allow",         # resume run_id if it exists, else create it
-            group=f"qwen3_{args.model}_{args.stage}",  # groups any legacy per-session runs too
-            config={
-                "model_config": model_cfg,
-                "stage":        args.stage,
-                "mix":          stage_cfg.mix.weights,
-                "resume":       str(args.resume) if args.resume else None,
-                "init_from":    str(args.init_from) if args.init_from else None,
-                **{k: v for k, v in stage_cfg.__dict__.items() if k != "mix"},
-            },
-        )
+    # mlflow — ONE continuous run per (model, stage): a persisted run_id file
+    # means every daily session and every --resume continues the SAME run, so
+    # pretrain is a single unbroken dashboard curve (and anneal is its own,
+    # separate run). See mlflow_utils.init_mlflow / docs/superpowers/specs/
+    # 2026-09-03-mlflow-local-tracking-design.md.
+    default_name = f"qwen3_{args.model}_{args.stage}".replace(".", "_")
+    run_id_file = args.mlflow_run_id_file or (args.ckpt_dir / f".mlflow_run_id_{args.stage}")
+    mlflow_enabled = init_mlflow(
+        enabled=not args.no_mlflow,
+        experiment=args.mlflow_experiment,
+        run_name=args.mlflow_run_name or default_name,
+        run_id_file=run_id_file,
+        stage=args.stage,
+        config={
+            "model_config": model_cfg,
+            "stage":        args.stage,
+            "mix":          stage_cfg.mix.weights,
+            "resume":       str(args.resume) if args.resume else None,
+            "init_from":    str(args.init_from) if args.init_from else None,
+            **{k: v for k, v in stage_cfg.__dict__.items() if k != "mix"},
+        },
+        tags={"group": f"qwen3_{args.model}_{args.stage}"},
+    )
 
     print(f"=== stage={args.stage} model={args.model} device={device} ===")
     print(stage_cfg)
@@ -233,7 +256,7 @@ def main():
             cfg=stage_cfg,
             device=device,
             ckpt_dir=args.ckpt_dir,
-            wandb_run=wandb_run,
+            mlflow_enabled=mlflow_enabled,
             resume_from=args.resume,
         )
     except Exception:
@@ -246,17 +269,14 @@ def main():
         # released immediately and the launcher can relaunch cleanly.
         import traceback
         traceback.print_exc()
-        if wandb_run is not None:
-            try:
-                wandb_run.finish(exit_code=1)
-            except Exception:
-                pass
+        if mlflow_enabled:
+            end_run_safe(status="FAILED")
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(1)
 
-    if wandb_run is not None:
-        wandb_run.finish()
+    if mlflow_enabled:
+        end_run_safe()
 
     print("\nstage summary:")
     for k, v in summary.items():
