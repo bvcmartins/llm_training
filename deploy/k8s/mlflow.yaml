@@ -34,7 +34,17 @@ spec:
             - server
             - --backend-store-uri
             - sqlite:////mlflow-data/mlflow.db
+            # mlflow-artifacts:/ (not a plain filesystem path) tells clients to
+            # route artifact reads/writes through this server's proxy API,
+            # backed on-disk by --artifacts-destination. A plain path here
+            # instead makes clients try to open that path directly on their
+            # OWN filesystem, which fails for any client that isn't literally
+            # inside this pod (confirmed: PermissionError: /mlflow-data from
+            # the host trying to log_artifact against a run created before
+            # this fix).
             - --default-artifact-root
+            - mlflow-artifacts:/
+            - --artifacts-destination
             - /mlflow-data/artifacts
             - --host
             - "0.0.0.0"

@@ -17,6 +17,11 @@ concatenates by step, and plots loss/ppl as two stacked panels sharing a step
 axis. A real gap in the data (missing steps) is left as a visible break in the
 line rather than interpolated across, so it isn't mistaken for real data.
 
+The chart is also uploaded as an mlflow artifact (same persisted-run-id trick
+as mlflow_utils.init_mlflow — reruns update the SAME run's artifacts rather
+than piling up a new run each time), so it's viewable directly in the mlflow
+UI: experiment "training-reports" -> run "loss-history" -> Artifacts tab.
+
 Usage: .venv/bin/python models/v3/scripts/plot_loss_history.py
 Outputs: models/v3/logs/loss_history.png, models/v3/logs/loss_history.csv
 """
@@ -35,6 +40,9 @@ TRACKING_URI = "http://airig.local:5000"
 EXPERIMENTS = ["llm-training-v3", "dense-model-1.5b-v3"]
 METRICS = ["loss", "ppl"]
 OUT_DIR = Path(__file__).resolve().parent.parent / "logs"
+REPORT_EXPERIMENT = "training-reports-v2"
+REPORT_RUN_NAME = "loss-history"
+REPORT_RUN_ID_FILE = OUT_DIR / ".mlflow_report_run_id"
 
 # A gap wider than this (in steps) between consecutive points is drawn as a
 # break in the line, not a straight interpolation across missing data.
@@ -73,6 +81,25 @@ def with_gaps(points: list[tuple[int, float]]) -> tuple[list[float], list[float]
         ys.append(value)
         prev_step = step
     return xs, ys
+
+
+def get_or_create_report_run(client: MlflowClient) -> str:
+    """Resume the same report run across reruns (persisted run_id file, same
+    trick as mlflow_utils.init_mlflow), so the UI has one stable place to
+    look rather than a new run piling up every time this script runs."""
+    exp = client.get_experiment_by_name(REPORT_EXPERIMENT)
+    exp_id = exp.experiment_id if exp else client.create_experiment(REPORT_EXPERIMENT)
+    if REPORT_RUN_ID_FILE.exists():
+        run_id = REPORT_RUN_ID_FILE.read_text().strip()
+        try:
+            client.get_run(run_id)
+            return run_id
+        except Exception:
+            pass  # run_id file is stale (run deleted server-side) - create fresh below
+    run = client.create_run(exp_id, run_name=REPORT_RUN_NAME)
+    REPORT_RUN_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    REPORT_RUN_ID_FILE.write_text(run.info.run_id)
+    return run.info.run_id
 
 
 def main():
@@ -114,6 +141,13 @@ def main():
     png_path = OUT_DIR / "loss_history.png"
     fig.savefig(png_path, dpi=150)
     print(f"wrote {png_path}")
+
+    run_id = get_or_create_report_run(client)
+    client.log_artifact(run_id, str(png_path))
+    client.log_artifact(run_id, str(csv_path))
+    print(f"uploaded to mlflow: experiment={REPORT_EXPERIMENT!r} run={REPORT_RUN_NAME!r} "
+          f"({TRACKING_URI}/#/experiments/{client.get_run(run_id).info.experiment_id}"
+          f"/runs/{run_id}/artifacts)")
 
 
 if __name__ == "__main__":
