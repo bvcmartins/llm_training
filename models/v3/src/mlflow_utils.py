@@ -69,7 +69,11 @@ def init_mlflow(
         mlflow.set_tracking_uri(TRACKING_URI)
         mlflow.set_experiment(experiment)
         existing_run_id = _load_run_id(run_id_file)
-        run = mlflow.start_run(run_id=existing_run_id, run_name=run_name)
+        # log_system_metrics logs GPU/CPU/mem stats (system/gpu_0_utilization_percentage,
+        # system/gpu_0_memory_usage_megabytes, ...) on a background sampling thread for
+        # the run's lifetime — mlflow's own monitor swallows failures internally (e.g. no
+        # pynvml, no GPU) and just logs a warning, so this is safe on any machine.
+        run = mlflow.start_run(run_id=existing_run_id, run_name=run_name, log_system_metrics=True)
         if existing_run_id is None:
             _save_run_id(run_id_file, run.info.run_id)
         mlflow.set_tag("stage", stage)
