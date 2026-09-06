@@ -66,6 +66,7 @@ spec:
             - { name: http, containerPort: 5000 }
           volumeMounts:
             - { name: storage, mountPath: /mlflow-data }
+            - { name: shm, mountPath: /dev/shm }
           readinessProbe:
             httpGet: { path: /health, port: 5000 }
             initialDelaySeconds: 10
@@ -81,6 +82,21 @@ spec:
         - name: storage
           persistentVolumeClaim:
             claimName: mlflow-storage
+        # mlflow's server puts its internal job-queue sqlite db (huey - not the
+        # tracking-store mlflow.db, which is fine on the PVC) on /dev/shm when
+        # available, falling back to a normal tempdir only if /dev/shm doesn't
+        # exist at all (mlflow/server/__init__.py). Kubernetes' default /dev/shm
+        # is a tiny 64Mi tmpfs, which the job queue silently fills under
+        # sustained load (confirmed: enabling log_system_metrics=True in
+        # llm_training on 2026-09-05 pushed it over, causing
+        # "sqlite3.OperationalError: database or disk is full" and a
+        # CrashLoopBackOff — the real mlflow.db on the PVC was untouched and
+        # tiny (117MB) the whole time). Give it real room instead of the
+        # container-runtime default.
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi
 ---
 apiVersion: v1
 kind: Service
