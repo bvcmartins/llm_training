@@ -240,11 +240,19 @@ def main():
             "model_config": model_cfg,
             "stage":        args.stage,
             "mix":          stage_cfg.mix.weights,
-            "resume":       str(args.resume) if args.resume else None,
-            "init_from":    str(args.init_from) if args.init_from else None,
             **{k: v for k, v in stage_cfg.__dict__.items() if k != "mix"},
         },
-        tags={"group": f"qwen3_{args.model}_{args.stage}"},
+        # resume/init_from change on every session (each night resumes from a
+        # newer checkpoint) — they must be tags, not params: mlflow params are
+        # immutable once logged for a run, and this is ONE continuous run
+        # across all daily sessions, so re-logging a changed value as a param
+        # throws and disables tracking for the whole session (see the mlflow-
+        # local-tracking-design doc).
+        tags={
+            "group": f"qwen3_{args.model}_{args.stage}",
+            **({"resume": str(args.resume)} if args.resume else {}),
+            **({"init_from": str(args.init_from)} if args.init_from else {}),
+        },
     )
 
     print(f"=== stage={args.stage} model={args.model} device={device} ===")
