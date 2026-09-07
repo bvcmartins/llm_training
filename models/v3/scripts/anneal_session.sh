@@ -22,6 +22,8 @@ PY="$ROOT/.venv/bin/python"
 STAGE=anneal
 MODEL=1.5b
 STOP_AT=08:55
+EVAL_EVERY=25   # matches training.py's ckpt_every=25 so every saved checkpoint
+                # has a matching val point (denser MLflow curve)
 BLACKOUT_START=$((9 * 60))
 BLACKOUT_END=$((22 * 60))
 LOCK=/tmp/v3_anneal.lock
@@ -77,6 +79,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONUNBUFFERED=1 \
     "$PY" "$V3/src/run.py" \
         --stage "$STAGE" --model "$MODEL" \
         "${SEED[@]}" --stop-at "$STOP_AT" \
+        --eval-every "$EVAL_EVERY" \
         --mlflow-experiment "$MLFLOW_EXPERIMENT" \
         --mlflow-run-id-file "$MLFLOW_RUN_ID_FILE" --mlflow-run-name "$MLFLOW_RUN_NAME" \
         >>"$LOG" 2>&1

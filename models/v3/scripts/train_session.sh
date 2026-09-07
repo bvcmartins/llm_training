@@ -28,6 +28,8 @@ PY="$ROOT/.venv/bin/python"
 STAGE=pretrain                 # this launcher is pretrain-only (anneal_session.sh does anneal)
 MODEL=1.5b
 STOP_AT=08:55                  # graceful self-stop, ~5 min before the daytime window
+EVAL_EVERY=25                  # matches training.py's ckpt_every=25 so every saved
+                               # checkpoint has a matching val point (denser MLflow curve)
 MLFLOW_EXPERIMENT=dense-model-1.5b-v3  # own branding, not the base arch's name
 MLFLOW_RUN_ID_FILE="$V3/checkpoints/.mlflow_run_id_pretrain"  # persisted id file so
 MLFLOW_RUN_NAME=pretrain       # every daily session continues THIS run. Prior qwen-named
@@ -87,6 +89,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONUNBUFFERED=1 \
     "$PY" "$V3/src/run.py" \
         --stage "$STAGE" --model "$MODEL" \
         --auto-resume --stop-at "$STOP_AT" \
+        --eval-every "$EVAL_EVERY" \
         --mlflow-experiment "$MLFLOW_EXPERIMENT" \
         --mlflow-run-id-file "$MLFLOW_RUN_ID_FILE" --mlflow-run-name "$MLFLOW_RUN_NAME" \
         >>"$LOG" 2>&1
