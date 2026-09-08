@@ -42,6 +42,34 @@ def _save_run_id(path: Path, run_id: str) -> None:
     path.write_text(run_id)
 
 
+def _log_params_best_effort(params: dict) -> None:
+    """Log each param individually, skipping (with a warning) any whose value
+    conflicts with what's already logged for this run.
+
+    mlflow params are immutable once logged, but this is one continuous run
+    across every daily session, and CLI overrides (eval_every, ckpt_every,
+    batch_size, ...) can legitimately differ from a prior session's value.
+    Logging as a batch means one such conflict raises and aborts every metric
+    for the whole session — logging one at a time contains the failure to
+    just that key.
+    """
+    import mlflow
+    from mlflow.exceptions import MlflowException
+
+    for k, v in params.items():
+        try:
+            mlflow.log_param(k, v)
+        except MlflowException as e:
+            # The tracking client catches the server's RestException itself and
+            # re-raises a plain MlflowException (see
+            # tracking/_tracking_service/client.py:log_param) — error_code is a
+            # string name on both, but neither reliably carries a `.json` attr,
+            # so check error_code rather than the exception's concrete type.
+            if e.error_code != "INVALID_PARAMETER_VALUE":
+                raise
+            log.warning("mlflow: param %s changed since first log — keeping original value", k)
+
+
 def init_mlflow(
     enabled: bool,
     experiment: str,
@@ -79,7 +107,7 @@ def init_mlflow(
         mlflow.set_tag("stage", stage)
         for k, v in (tags or {}).items():
             mlflow.set_tag(k, v)
-        mlflow.log_params(flatten_params(config))
+        _log_params_best_effort(flatten_params(config))
         log.info("mlflow run: experiment=%s name=%s id=%s", experiment, run_name, run.info.run_id)
         return True
     except Exception:
