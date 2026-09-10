@@ -75,9 +75,16 @@ spec:
             httpGet: { path: /health, port: 5000 }
             initialDelaySeconds: 20
             periodSeconds: 30
+          # 2026-09-09: OOMKilled crash-loop (223 restarts) — NOT the /dev/shm
+          # issue from 33c741a (shm was empty). mlflow.db grew to 153MB from
+          # log_system_metrics=True over a multi-day continuous run plus the
+          # denser eval-every=25 logging, and the server now sits pinned at
+          # essentially the full 2Gi limit just at steady state (confirmed via
+          # cgroup memory.current), one allocation spike from OOM. Doubled
+          # headroom rather than chasing the exact allocation inside mlflow.
           resources:
-            requests: { cpu: "100m", memory: "512Mi" }
-            limits:   { memory: "2Gi" }
+            requests: { cpu: "100m", memory: "1Gi" }
+            limits:   { memory: "4Gi" }
       volumes:
         - name: storage
           persistentVolumeClaim:
